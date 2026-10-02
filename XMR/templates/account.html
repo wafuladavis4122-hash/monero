@@ -1852,7 +1852,7 @@
         <div class="modal-content">
             <div class="modal-header"><h5 class="modal-title">Make a Deposit</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
             <div class="modal-body">
-                <div class="payment-instructions"><h6><i class="bi bi-info-circle me-2"></i>M-Pesa Payment Instructions</h6><p>1. Go to M-Pesa on your phone</p><p>2. Select <strong>Send Money</strong></p><p>3. Enter Business No: <strong class="text-primary">0729383065</strong></p><p>4. Account Name: <strong class="text-primary">Andrew Mwanywe</strong></p><p>5. Enter Amount and complete payment</p><p class="mt-2 mb-0 text-warning"><i class="bi bi-exclamation-triangle"></i> Minimum deposit: <strong>{{ min_deposit }} KSH</strong></p></div>
+                <div class="payment-instructions"><h6><i class="bi bi-info-circle me-2"></i>M-Pesa Payment Instructions</h6><p>1. Go to M-Pesa on your phone</p><p>2. Select <strong>Send Money</strong></p><p>3. Enter Business No: <strong class="text-primary">0737123933</strong></p><p>4. Account Name: <strong class="text-primary">HABIB KASIM</strong></p><p>5. Enter Amount and complete payment</p><p class="mt-2 mb-0 text-warning"><i class="bi bi-exclamation-triangle"></i> Minimum deposit: <strong>{{ min_deposit }} KSH</strong></p></div>
                 <form method="POST" action="{% url 'XMR:create_deposit' %}" enctype="multipart/form-data">
                     {% csrf_token %}
                     <div class="form-group"><label class="form-label">Amount (KSH) <span class="text-danger">*</span></label><input type="number" class="form-control" name="amount" min="{{ min_deposit }}" step="0.01" required><small class="text-muted">Minimum deposit: {{ min_deposit }} KSH</small></div>
