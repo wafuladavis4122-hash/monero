@@ -26,7 +26,7 @@ SECRET_KEY = 'django-insecure-zn4^ja5q#5fty-ybo59_dym+u#_ojm%r7h2@@wvj+ht7@dxppx
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
 
-ALLOWED_HOSTS = ['fb2e-41-90-68-15.ngrok-free.app', 'localhost','monero.pythonanywhere.com',
+ALLOWED_HOSTS = ['fb2e-41-90-68-15.ngrok-free.app', 'localhost','monera.pythonanywhere.com',
     '127.0.0.1',]
 
 CSRF_TRUSTED_ORIGINS = [    
