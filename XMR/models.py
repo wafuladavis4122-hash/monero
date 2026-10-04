@@ -274,7 +274,7 @@ class Transaction(TimeStampedModel):
         ('PROFIT', 'Profit'),
         ('REFERRAL_BONUS', 'Referral Bonus'),
         ('PENALTY', 'Penalty'),
-        ('ADJUSTMENT', 'Admin Adjustment'),
+        ('ADJUSTMENT', 'Credited'),
     ]
 
     STATUS_CHOICES = [
