@@ -266,15 +266,13 @@ if not hasattr(cache, 'delete_pattern'):
     cache.delete_pattern = safe_cache_delete_pattern
 
 # ==================== AUTO PAYOUT HELPER FUNCTION ====================
-# ==================== CORRECTED AUTO PAYOUT HELPER FUNCTIONS ====================
-
 def check_user_payouts(user):
     """
     Enhanced version that ONLY processes payouts on weekdays (Monday-Friday)
-    Weekends are skipped - payouts accumulate and process on the next business day
+    AND only when at least 24 hours have passed since the last payout.
 
     This function is called when users visit their account or investments page.
-    It processes ONE payout per business day that has passed since the last payout.
+    It processes at most ONE payout per check, and only if 24+ hours have passed.
     """
     if not user.is_authenticated:
         return 0
@@ -299,39 +297,53 @@ def check_user_payouts(user):
 
     for investment in investments:
         try:
-            # Calculate how many business days have passed since last payout
+            # Determine reference time (last payout or creation)
             reference_time = investment.last_payout_date or investment.created_at
 
-            # Count business days (weekdays only) between reference and now
-            business_days_passed = count_business_days(reference_time, now)
+            # ===== CRITICAL FIX: Check if 24 HOURS have actually passed =====
+            hours_since_last = (now - reference_time).total_seconds() / 3600
 
-            # Process exactly ONE payout per business day that has passed
-            # This handles catch-up for missed weekdays (e.g., Monday catches up Friday)
-            if business_days_passed >= 1:
-                # Process only ONE payout per check to prevent multiple in one day
-                success = investment.process_daily_payout()
-                if success:
-                    processed_count += 1
-                    logger.info(f"✅ Processed weekday payout for investment {investment.id} (User: {user.username})")
-                else:
-                    logger.warning(f"⚠️ Failed to process payout for investment {investment.id}")
-                    break  # Stop if we hit an error
+            # Only process if at least 24 hours have passed
+            if hours_since_last < 24:
+                logger.debug(
+                    f"Investment {investment.id}: Only {hours_since_last:.1f} hours since last payout. "
+                    f"Need 24 hours. Skipping."
+                )
+                continue
+
+            # ===== ADDITIONAL CHECK: Ensure it's a weekday =====
+            if not is_weekday(now):
+                logger.debug(f"Investment {investment.id}: Today is not a weekday. Skipping.")
+                continue
+
+            # ===== PROCESS THE PAYOUT =====
+            # Only process ONE payout per check to prevent multiple payouts on same day
+            success = investment.process_daily_payout()
+            if success:
+                processed_count += 1
+                logger.info(
+                    f"✅ Processed payout for investment {investment.id} "
+                    f"(User: {user.username}, Hours since last: {hours_since_last:.1f})"
+                )
+                # Break after processing one payout to prevent multiple in one request
+                break
+            else:
+                logger.warning(f"⚠️ Failed to process payout for investment {investment.id}")
 
         except Exception as e:
             logger.error(f"❌ Auto-payout error for investment {investment.id}: {str(e)}", exc_info=True)
 
     if processed_count > 0:
-        logger.info(f"📊 Processed {processed_count} weekday payouts for user {user.username}")
+        logger.info(f"📊 Processed {processed_count} payout(s) for user {user.username}")
 
     return processed_count
 
-
 def calculate_missed_payouts(investment, current_time):
     """
-    Calculate how many payouts are due based on business days only
-    Only counts Monday-Friday as eligible payout days
+    Calculate how many payouts are due based on business days only.
+    Only counts Monday-Friday as eligible payout days AND respects
+    the 24-hour minimum gap between payouts.
 
-    This is used for admin catch-up and reporting.
     Returns integer number of payouts that should have been processed.
     """
     from datetime import timedelta
@@ -341,30 +353,22 @@ def calculate_missed_payouts(investment, current_time):
         return 0
 
     # Base reference time for calculations
-    if not investment.last_payout_date:
-        # No payouts yet - base is creation time
-        reference_time = investment.created_at
-        payouts_done = 0
-    else:
-        # Already had some payouts - base is last payout time
-        reference_time = investment.last_payout_date
-        # Count how many payouts have been done
-        payouts_done = investment.token.return_days - investment.remaining_payouts
+    reference_time = investment.last_payout_date or investment.created_at
+
+    # ===== CRITICAL FIX: Check the 24-hour window first =====
+    hours_since_last = (current_time - reference_time).total_seconds() / 3600
+    if hours_since_last < 24:
+        return 0
 
     # Count business days between reference and current time
     business_days_passed = count_business_days(reference_time, current_time)
 
-    # Calculate total possible business days since investment started
-    total_business_days_possible = count_business_days(investment.created_at, current_time)
-
-    # Expected payouts = business days passed since last payout
-    expected_payouts = business_days_passed
-
-    # Calculate how many payouts should have been processed in total
-    total_expected = total_business_days_possible - payouts_done
+    # If no full business day has passed since last payout, nothing is due
+    if business_days_passed < 1:
+        return 0
 
     # Don't exceed remaining_payouts
-    due_payouts = min(expected_payouts, investment.remaining_payouts)
+    due_payouts = min(business_days_passed, investment.remaining_payouts)
 
     # Log for debugging
     if due_payouts > 0:
@@ -373,15 +377,13 @@ def calculate_missed_payouts(investment, current_time):
             - Created: {investment.created_at}
             - Last payout: {investment.last_payout_date}
             - Current time: {current_time}
+            - Hours since last: {hours_since_last:.1f}
             - Business days passed: {business_days_passed}
-            - Payouts done: {payouts_done}
-            - Expected: {expected_payouts}
-            - Total expected: {total_expected}
+            - Remaining payouts: {investment.remaining_payouts}
             - Due now: {due_payouts}
         """)
 
     return due_payouts
-
 
 def catch_up_all_users_payouts():
     """
@@ -2590,72 +2592,109 @@ def validate_phone_number(phone):
 
 
 # ==================== CRON JOBS / MANAGEMENT COMMANDS ====================
-def process_daily_payouts():
+def process_daily_payout(self):
     """
-    Process daily payouts for all active investments
-    ONLY runs on weekdays (Monday-Friday)
+    Process a single daily payout for this investment.
 
-    This is called by the cron job or admin trigger.
+    GUARDS:
+    - Only runs on weekdays (Monday-Friday)
+    - Only runs if at least 24 hours have passed since the last payout
+    - Only runs if the investment is still ACTIVE with remaining payouts
+
+    Returns True if a payout was processed, False otherwise.
     """
+    from django.utils import timezone
+    from decimal import Decimal
+    from django.db import transaction
+
     now = timezone.now()
 
-    # ===== WEEKEND CHECK =====
-    if is_weekend(now):
-        print(f"{now.strftime('%A, %B %d, %Y')}: Weekend detected - Payouts paused")
-        logger.info(f"Weekend detected ({now.strftime('%A')}) - Daily payouts paused")
+    # ===== GUARD 1: Weekend check =====
+    if now.weekday() >= 5:  # Saturday = 5, Sunday = 6
+        return False
 
-        SystemLog.objects.create(
-            log_type='INFO',
-            action='PAYOUT_PAUSED',
-            description=f'Payouts paused - Weekend ({now.strftime("%A")})',
-        )
-        return 0, 0
+    # ===== GUARD 2: Must be ACTIVE with remaining payouts =====
+    if self.status != 'ACTIVE' or self.remaining_payouts <= 0:
+        return False
 
-    print(f"{now}: Starting daily payout processing...")
-    logger.info(f"Starting daily payout processing for {now.strftime('%A')}")
+    # ===== GUARD 3: 24-hour minimum gap =====
+    reference_time = self.last_payout_date or self.created_at
+    hours_since_last = (now - reference_time).total_seconds() / 3600
 
-    active_investments = Investment.objects.filter(
-        status='ACTIVE',
-        remaining_payouts__gt=0
-    )
+    if hours_since_last < 24:
+        return False
 
-    processed = 0
-    errors = 0
+    # ===== PROCESS THE PAYOUT =====
+    try:
+        with transaction.atomic():
+            # Lock this investment row to prevent race conditions
+            from .models import Investment
+            locked = Investment.objects.select_for_update().get(pk=self.pk)
 
-    for investment in active_investments:
-        try:
-            # Check if enough business days have passed
-            reference_time = investment.last_payout_date or investment.created_at
-            business_days_passed = count_business_days(reference_time, now)
+            # Re-check guards on the locked row
+            if locked.status != 'ACTIVE' or locked.remaining_payouts <= 0:
+                return False
 
-            # Only process if at least one business day has passed
-            if business_days_passed >= 1:
-                success = investment.process_daily_payout()
-                if success:
-                    processed += 1
-                    if processed % 100 == 0:
-                        print(f"Processed {processed} investments...")
-                else:
-                    errors += 1
-                    logger.warning(f"Failed to process payout for investment {investment.id}")
+            ref_time = locked.last_payout_date or locked.created_at
+            if (now - ref_time).total_seconds() / 3600 < 24:
+                return False
 
-        except Exception as e:
-            errors += 1
-            print(f"Error processing investment {investment.id}: {str(e)}")
-            logger.error(f"Daily payout error for investment {investment.id}: {str(e)}", exc_info=True)
+            wallet = locked.user.wallet
+            payout_amount = locked.daily_return
 
-    print(f"Completed: {processed} payouts processed, {errors} errors")
-    logger.info(f"Daily payouts completed - Processed: {processed}, Errors: {errors}")
+            # Create the profit transaction
+            from .models import Transaction
+            transaction_record = Transaction.objects.create(
+                wallet=wallet,
+                transaction_type='PROFIT',
+                amount=payout_amount,
+                description=f"Daily payout from {locked.token.name}",
+                status='COMPLETED',
+                investment=locked,
+                processed_at=now,
+            )
 
-    SystemLog.objects.create(
-        log_type='INFO',
-        action='DAILY_PAYOUT',
-        description=f'Daily payouts completed. Processed: {processed}, Errors: {errors}',
-    )
+            # Credit the wallet available balance
+            wallet.balance += payout_amount
+            wallet.total_earned = (wallet.total_earned or Decimal('0')) + payout_amount
+            wallet.save(update_fields=['balance', 'total_earned'])
 
-    return processed, errors
+            # Update the investment
+            locked.total_paid = (locked.total_paid or Decimal('0')) + payout_amount
+            locked.remaining_payouts -= 1
+            locked.last_payout_date = now
 
+            # If no more payouts remain, complete the investment
+            if locked.remaining_payouts <= 0:
+                locked.status = 'COMPLETED'
+                locked.end_date = now
+                # Return principal to available balance
+                wallet.balance += locked.amount
+                wallet.locked_balance = max(
+                    Decimal('0'), (wallet.locked_balance or Decimal('0')) - locked.amount
+                )
+                wallet.save(update_fields=['balance', 'locked_balance'])
 
+            locked.save(update_fields=[
+                'total_paid', 'remaining_payouts', 'last_payout_date',
+                'status', 'end_date'
+            ])
+
+            # Update self so caller sees fresh values
+            self.total_paid = locked.total_paid
+            self.remaining_payouts = locked.remaining_payouts
+            self.last_payout_date = locked.last_payout_date
+            self.status = locked.status
+            self.end_date = locked.end_date
+
+            return True
+
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"process_daily_payout failed for investment {self.id}: {e}", exc_info=True)
+        return False
+        
 def check_expired_investments():
     """Check for investments that have passed their end date"""
     expired = Investment.objects.filter(
@@ -3778,23 +3817,24 @@ def check_investment_payouts_api(request, investment_id):
     """API endpoint to check missed payouts for an investment"""
     if not request.user.is_staff:
         return JsonResponse({'error': 'Unauthorized'}, status=403)
-    
+
     try:
         investment = Investment.objects.get(id=investment_id)
-        
+
         # Calculate missed payouts
         now = timezone.now()
         missed = calculate_missed_payouts(investment, now)
-        
+
         # Process them if requested
         if request.POST.get('process', 'false') == 'true':
             processed = 0
             for i in range(missed):
+                # process_daily_payout() has its own 24h + weekday guards
                 if investment.process_daily_payout():
                     processed += 1
                 else:
                     break
-            
+
             return JsonResponse({
                 'success': True,
                 'missed': missed,
@@ -3807,12 +3847,11 @@ def check_investment_payouts_api(request, investment_id):
                 'missed': missed,
                 'message': f'Found {missed} missed payouts'
             })
-            
+
     except Investment.DoesNotExist:
         return JsonResponse({'success': False, 'error': 'Investment not found'}, status=404)
     except Exception as e:
         return JsonResponse({'success': False, 'error': str(e)}, status=500)
-
 
 @login_required(login_url='XMR:signupin')
 def process_payout_api(request, investment_id):
