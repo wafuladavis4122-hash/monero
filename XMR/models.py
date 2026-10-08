@@ -11,6 +11,9 @@ from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
 from django.core.exceptions import ValidationError
 from datetime import timedelta
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ==================== BASE MODELS ====================
@@ -50,7 +53,11 @@ def is_weekend(date=None):
 
 def count_business_days(start_date, end_date):
     """
-    Count business days (Monday-Friday) between two dates
+    Count business days (Monday-Friday) between two dates.
+
+    NOTE: This is DATE-based only. It does NOT enforce a 24-hour gap.
+    Callers must separately check `(now - reference_time).total_seconds() / 3600 >= 24`
+    before treating a payout as due.
     """
     if start_date > end_date:
         return 0
@@ -77,7 +84,7 @@ def count_business_days(start_date, end_date):
 
 def get_next_business_day(date=None):
     """
-    Get the next business day (Monday-Friday)
+    Get the next business day (Monday-Friday) AFTER the given date.
     """
     if date is None:
         date = timezone.now()
@@ -110,6 +117,8 @@ def get_business_days_add(date, days_to_add):
 
     return current_date
 
+
+# ==================== USER PROFILE ====================
 
 class UserProfile(TimeStampedModel):
     """
@@ -168,18 +177,15 @@ class UserProfile(TimeStampedModel):
                 return code
 
     def get_referral_count(self):
-        """Get total number of direct referrals"""
         return self.referrals.count()
 
     def get_total_referral_earnings(self):
-        """Calculate total earnings from referrals"""
         return self.user.wallet.transactions.filter(
             transaction_type='REFERRAL_BONUS',
             status='COMPLETED'
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
 
     def get_total_deposits(self):
-        """Get total deposits made by user"""
         return self.user.wallet.transactions.filter(
             transaction_type='DEPOSIT',
             status='COMPLETED'
@@ -194,19 +200,15 @@ class UserProfile(TimeStampedModel):
 class Wallet(TimeStampedModel):
     """
     User's wallet for managing funds.
-    - balance: Available money the user can withdraw or invest (deposits + profits - withdrawals - investments)
-    - locked_balance: Money currently active in investments (cannot be withdrawn until investment completes)
+    - balance: Available money the user can withdraw or invest
+    - locked_balance: Money currently active in investments
     """
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='wallet')
-    balance = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))  # Available balance
-    locked_balance = models.DecimalField(max_digits=20, decimal_places=2,
-                                         default=Decimal('0.00'))  # Funds in active investments
+    balance = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))
+    locked_balance = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))
     total_deposited = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))
     total_withdrawn = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))
-    total_earned = models.DecimalField(max_digits=20, decimal_places=2,
-                                       default=Decimal('0.00'))  # Profits + referral bonuses
-
-    # Currency (default KSH)
+    total_earned = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))
     currency = models.CharField(max_length=3, default='KSH')
 
     class Meta:
@@ -215,11 +217,9 @@ class Wallet(TimeStampedModel):
         ]
 
     def available_balance(self):
-        """Balance available for withdrawal/investment (should never be negative)"""
         return self.balance
 
     def get_breakdown(self):
-        """Get wallet breakdown for display"""
         return {
             'available_balance': self.balance,
             'locked_in_investments': self.locked_balance,
@@ -230,28 +230,22 @@ class Wallet(TimeStampedModel):
         }
 
     def can_invest(self, amount):
-        """Check if user has enough available balance to invest"""
         return self.balance >= amount
 
     def can_withdraw(self, amount):
-        """Check if user has enough available balance to withdraw"""
         return self.balance >= amount
 
     def update_balances(self):
-        """Recalculate balances from transactions (admin use only)"""
         deposits = self.transactions.filter(
-            transaction_type='DEPOSIT',
-            status='COMPLETED'
+            transaction_type='DEPOSIT', status='COMPLETED'
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
 
         withdrawals = self.transactions.filter(
-            transaction_type='WITHDRAWAL',
-            status='COMPLETED'
+            transaction_type='WITHDRAWAL', status='COMPLETED'
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
 
         earnings = self.transactions.filter(
-            transaction_type='PROFIT',
-            status='COMPLETED'
+            transaction_type='PROFIT', status='COMPLETED'
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
 
         self.total_deposited = deposits
@@ -266,6 +260,8 @@ class Wallet(TimeStampedModel):
 class Transaction(TimeStampedModel):
     """
     All financial transactions in the system.
+    Includes a `payout_date` + unique constraint to guarantee at most ONE
+    PROFIT transaction per investment per calendar day.
     """
     TRANSACTION_TYPES = [
         ('DEPOSIT', 'Deposit'),
@@ -298,6 +294,9 @@ class Transaction(TimeStampedModel):
     withdrawal = models.ForeignKey('WithdrawalRequest', on_delete=models.SET_NULL, null=True, blank=True,
                                    related_name='transaction_entries')
 
+    # Payout date - only used for PROFIT transactions (one per investment per day)
+    payout_date = models.DateField(null=True, blank=True, db_index=True)
+
     # Metadata
     processed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
                                      related_name='processed_transactions')
@@ -311,11 +310,24 @@ class Transaction(TimeStampedModel):
             models.Index(fields=['wallet', 'status']),
             models.Index(fields=['wallet', 'transaction_type']),
             models.Index(fields=['-created_at']),
+            models.Index(fields=['investment', 'payout_date']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['investment', 'payout_date'],
+                condition=Q(transaction_type='PROFIT', investment__isnull=False, payout_date__isnull=False),
+                name='unique_daily_profit_per_investment',
+            ),
         ]
 
     def save(self, *args, **kwargs):
-        if not self.transaction_id:
+        if not self.transaction_id or self.transaction_id == uuid.UUID(int=0):
             self.transaction_id = f"TXN{timezone.now().strftime('%Y%m%d%H%M%S')}{random.randint(1000, 9999)}"
+
+        # Auto-set payout_date on PROFIT transactions
+        if self.transaction_type == 'PROFIT' and self.payout_date is None:
+            self.payout_date = timezone.now().date()
+
         super().save(*args, **kwargs)
 
     def process(self, admin_user=None):
@@ -327,7 +339,6 @@ class Transaction(TimeStampedModel):
         self.processed_by = admin_user
         self.processed_at = timezone.now()
 
-        # Update wallet balance based on transaction type
         if self.transaction_type in ['DEPOSIT', 'PROFIT', 'REFERRAL_BONUS']:
             self.wallet.balance += self.amount
         elif self.transaction_type == 'WITHDRAWAL':
@@ -335,7 +346,6 @@ class Transaction(TimeStampedModel):
                 raise ValidationError("Insufficient available balance")
             self.wallet.balance -= self.amount
         elif self.transaction_type == 'INVESTMENT':
-            # Investment is handled in Investment model save method
             pass
 
         self.wallet.save()
@@ -362,28 +372,21 @@ class MpesaPayment(TimeStampedModel):
     transaction = models.OneToOneField(Transaction, on_delete=models.CASCADE, related_name='mpesa_payment', null=True,
                                        blank=True)
 
-    # Payment details
     amount = models.DecimalField(max_digits=20, decimal_places=2, validators=[MinValueValidator(Decimal('800.00'))])
-    phone_number = models.CharField(max_length=15)  # Sender's phone
+    phone_number = models.CharField(max_length=15)
 
-    # M-Pesa message/screenshot
     mpesa_message = models.TextField(help_text="Full M-Pesa confirmation message")
     mpesa_screenshot = models.ImageField(upload_to='mpesa/screenshots/%Y/%m/%d/', blank=True, null=True)
 
-    # Extracted data from message
-    mpesa_code = models.CharField(max_length=50, blank=True, null=True, db_index=True,
-                                  help_text="Extracted M-Pesa transaction code")
+    mpesa_code = models.CharField(max_length=50, blank=True, null=True, db_index=True)
     transaction_date = models.DateTimeField(blank=True, null=True)
     sender_name = models.CharField(max_length=100, blank=True, null=True)
 
-    # Status
     status = models.CharField(max_length=20, choices=PAYMENT_STATUS, default='PENDING', db_index=True)
     verified_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
                                     related_name='verified_payments')
     verified_at = models.DateTimeField(null=True, blank=True)
     rejection_reason = models.TextField(blank=True, null=True)
-
-    # Admin notes
     admin_notes = models.TextField(blank=True, null=True)
 
     class Meta:
@@ -395,26 +398,20 @@ class MpesaPayment(TimeStampedModel):
         ]
 
     def extract_mpesa_data(self):
-        """Extract transaction code, date, and sender from M-Pesa message."""
         import re
-        from datetime import datetime
-
         message = self.mpesa_message
 
-        # Extract M-Pesa confirmation code
         code_patterns = [
             r'([A-Z0-9]{10,12})',
             r'Confirmation\.?([A-Z0-9]+)',
             r'([A-Z0-9]+)\s+Confirmed',
         ]
-
         for pattern in code_patterns:
             match = re.search(pattern, message)
             if match:
                 self.mpesa_code = match.group(1)
                 break
 
-        # Extract amount
         amount_pattern = r'(?:Ksh|KES|KSh)[\s.]*([0-9,]+(?:\.[0-9]{2})?)'
         amount_match = re.search(amount_pattern, message, re.IGNORECASE)
         if amount_match:
@@ -423,7 +420,6 @@ class MpesaPayment(TimeStampedModel):
             if abs(extracted_amount - self.amount) > Decimal('1.00'):
                 self.admin_notes = f"Amount mismatch: Message shows {extracted_amount}"
 
-        # Extract sender phone
         phone_pattern = r'(?:from|sender)[\s:]*0?(\d{9,12})'
         phone_match = re.search(phone_pattern, message, re.IGNORECASE)
         if phone_match:
@@ -432,7 +428,6 @@ class MpesaPayment(TimeStampedModel):
         self.save()
 
     def verify(self, admin_user):
-        """Admin verification of M-Pesa payment"""
         if self.status != 'PENDING':
             raise ValidationError("Can only verify pending payments")
 
@@ -441,7 +436,6 @@ class MpesaPayment(TimeStampedModel):
         self.verified_at = timezone.now()
         self.save()
 
-        # Create deposit transaction
         transaction = Transaction.objects.create(
             wallet=self.user.wallet,
             transaction_type='DEPOSIT',
@@ -453,24 +447,20 @@ class MpesaPayment(TimeStampedModel):
         transaction.processed_at = timezone.now()
         transaction.save()
 
-        # Link to this payment
         self.transaction = transaction
         self.save()
 
-        # Update wallet - add to available balance
         wallet = self.user.wallet
         wallet.balance += self.amount
         wallet.total_deposited += self.amount
         wallet.save()
 
-        # Process first deposit referral bonus
         if wallet.total_deposited == self.amount:
             self.process_referral_bonus()
 
         return transaction
 
     def process_referral_bonus(self):
-        """Give 5% referral bonus to referrer on first deposit"""
         profile = self.user.profile
         if profile.referred_by:
             referrer = profile.referred_by.user
@@ -489,7 +479,6 @@ class MpesaPayment(TimeStampedModel):
             referrer.wallet.save()
 
     def reject(self, admin_user, reason):
-        """Reject a payment"""
         self.status = 'REJECTED'
         self.verified_by = admin_user
         self.verified_at = timezone.now()
@@ -517,24 +506,20 @@ class Token(TimeStampedModel):
     display_name = models.CharField(max_length=50)
     token_number = models.IntegerField(unique=True, validators=[MinValueValidator(1), MaxValueValidator(20)])
 
-    # Investment details
     minimum_investment = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('800.00'))
     daily_return = models.DecimalField(max_digits=10, decimal_places=2, help_text="Daily return in KSH")
     return_days = models.IntegerField(default=12, help_text="Number of business days returns are paid")
     total_return = models.DecimalField(max_digits=20, decimal_places=2, editable=False)
 
-    # Token status
     status = models.CharField(max_length=20, choices=TOKEN_STATUS, default='ACTIVE', db_index=True)
 
-    # Limits
-    max_purchases_per_user = models.IntegerField(default=1, help_text="Maximum times a user can buy this token")
-    total_supply = models.IntegerField(null=True, blank=True, help_text="Total available tokens, null for unlimited")
+    max_purchases_per_user = models.IntegerField(default=1)
+    total_supply = models.IntegerField(null=True, blank=True)
     purchased_count = models.IntegerField(default=0, editable=False)
 
-    # Metadata
     description = models.TextField(blank=True)
-    icon = models.CharField(max_length=50, blank=True, help_text="FontAwesome or custom icon class")
-    color = models.CharField(max_length=20, default='primary', help_text="Bootstrap color class")
+    icon = models.CharField(max_length=50, blank=True)
+    color = models.CharField(max_length=20, default='primary')
 
     class Meta:
         ordering = ['token_number']
@@ -549,7 +534,6 @@ class Token(TimeStampedModel):
         super().save(*args, **kwargs)
 
     def is_available(self):
-        """Check if token is available for purchase"""
         if self.status != 'ACTIVE':
             return False
         if self.total_supply and self.purchased_count >= self.total_supply:
@@ -557,7 +541,6 @@ class Token(TimeStampedModel):
         return True
 
     def get_roi_percentage(self):
-        """Calculate ROI percentage"""
         return (self.total_return / self.minimum_investment) * 100
 
     def __str__(self):
@@ -567,6 +550,7 @@ class Token(TimeStampedModel):
 class Investment(TimeStampedModel):
     """
     User's investment in a token - Uses BUSINESS DAYS for all calculations
+    AND enforces a strict 24-hour gap between payouts.
     """
     INVESTMENT_STATUS = [
         ('ACTIVE', 'Active'),
@@ -579,25 +563,23 @@ class Investment(TimeStampedModel):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='investments')
     token = models.ForeignKey(Token, on_delete=models.PROTECT, related_name='investments')
 
-    # Investment details
     amount = models.DecimalField(max_digits=20, decimal_places=2, validators=[MinValueValidator(Decimal('800.00'))])
     daily_return = models.DecimalField(max_digits=10, decimal_places=2)
 
-    # Dates
     start_date = models.DateTimeField(default=timezone.now)
     end_date = models.DateTimeField()
     last_payout_date = models.DateTimeField(null=True, blank=True)
 
-    # Status
     status = models.CharField(max_length=20, choices=INVESTMENT_STATUS, default='ACTIVE', db_index=True)
 
-    # Returns tracking
     total_paid = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))
     remaining_payouts = models.IntegerField()
 
-    # Related transaction
     transaction = models.OneToOneField(Transaction, on_delete=models.SET_NULL, null=True, blank=True,
                                        related_name='investment_purchase')
+
+    # 24-hour payout guard constant
+    MIN_HOURS_BETWEEN_PAYOUTS = 24
 
     class Meta:
         ordering = ['-created_at']
@@ -605,48 +587,38 @@ class Investment(TimeStampedModel):
             models.Index(fields=['user', 'status']),
             models.Index(fields=['end_date', 'status']),
             models.Index(fields=['investment_id']),
+            models.Index(fields=['status', 'last_payout_date']),
         ]
 
     # ===== BUSINESS DAY HELPER METHODS =====
 
     def calculate_end_date(self):
-        """
-        Calculate end date based on business days only (Monday-Friday)
-        Returns: datetime of the last business day
-        """
+        """Calculate end date based on business days only (Monday-Friday)"""
         start = self.start_date
         days_remaining = self.token.return_days
         current_date = start
-
-        # Count forward only business days
         business_days_counted = 0
 
         while business_days_counted < days_remaining:
             current_date += timedelta(days=1)
-            # Only count if it's a weekday (Monday-Friday)
             if current_date.weekday() < 5:
                 business_days_counted += 1
 
         return current_date
 
     def get_business_days_remaining(self, from_date=None):
-        """
-        Calculate business days remaining until end_date
-        Returns: integer number of business days remaining
-        """
+        """Calculate business days remaining until end_date"""
         if from_date is None:
             from_date = timezone.now()
-
         if from_date >= self.end_date:
             return 0
 
-        # Count business days between now and end_date
         current = from_date.date()
         end = self.end_date.date()
         business_days = 0
 
         while current <= end:
-            if current.weekday() < 5:  # Monday-Friday
+            if current.weekday() < 5:
                 business_days += 1
             current += timedelta(days=1)
 
@@ -654,75 +626,68 @@ class Investment(TimeStampedModel):
 
     def get_next_payout_date(self):
         """
-        Get the next business day payout date
-        Returns: datetime of next payout (always a weekday)
+        Get the next business day payout date.
+        Always returns a weekday (Mon-Fri).
         """
         now = timezone.now()
 
-        # If no payouts yet, next payout is 24 business hours after creation
+        # Reference: last payout or creation time + 24h
         if not self.last_payout_date:
-            next_date = self.created_at + timedelta(days=1)
+            next_date = self.created_at + timedelta(hours=self.MIN_HOURS_BETWEEN_PAYOUTS)
         else:
-            next_date = self.last_payout_date + timedelta(days=1)
+            next_date = self.last_payout_date + timedelta(hours=self.MIN_HOURS_BETWEEN_PAYOUTS)
 
-        # If it's a weekend, move to next Monday
-        while next_date.weekday() >= 5:  # Saturday (5) or Sunday (6)
+        # Skip weekends
+        while next_date.weekday() >= 5:
             next_date += timedelta(days=1)
 
         return next_date
 
     def get_business_days_until_payout(self):
-        """
-        Get business days until next payout
-        Returns: tuple (days, hours, minutes)
-        """
+        """Get business days until next payout (days, hours, minutes)"""
         next_payout = self.get_next_payout_date()
         now = timezone.now()
 
         if next_payout <= now:
             return (0, 0, 0)
 
-        # Calculate difference
         diff = next_payout - now
         total_seconds = diff.total_seconds()
-
         days = int(total_seconds // (24 * 3600))
         hours = int((total_seconds % (24 * 3600)) // 3600)
         minutes = int((total_seconds % 3600) // 60)
-
         return (days, hours, minutes)
+
+    def _hours_since_reference(self, now=None):
+        """Return hours since last payout (or creation)."""
+        if now is None:
+            now = timezone.now()
+        reference = self.last_payout_date or self.created_at
+        return (now - reference).total_seconds() / 3600
 
     # ===== SAVE METHOD =====
 
     def save(self, *args, **kwargs):
-        if not self.pk:  # New investment
-            # Check if token is still available
+        if not self.pk:
             if not self.token.is_available():
                 raise ValidationError("This token is no longer available")
 
             self.daily_return = self.token.daily_return
 
-            # === FIXED: Calculate end date using BUSINESS DAYS ===
             self.start_date = timezone.now()
             self.end_date = self.calculate_end_date()
             self.remaining_payouts = self.token.return_days
 
-            # Lock the funds in wallet
             wallet = self.user.wallet
-
-            # Check if user has enough available balance
             if wallet.balance < self.amount:
                 raise ValidationError(f"Insufficient available balance. You have {wallet.balance} KSH available.")
 
-            # MOVE money from available to locked
             wallet.balance -= self.amount
             wallet.locked_balance += self.amount
             wallet.save()
 
-            # Save investment first to get an ID
             super().save(*args, **kwargs)
 
-            # Create transaction with the saved investment
             transaction = Transaction.objects.create(
                 wallet=wallet,
                 transaction_type='INVESTMENT',
@@ -732,129 +697,175 @@ class Investment(TimeStampedModel):
                 investment=self
             )
 
-            # Update investment with transaction reference
             self.transaction = transaction
             super().save(update_fields=['transaction'])
 
-            # Update token purchase count
             self.token.purchased_count += 1
             self.token.save()
 
-        else:  # Existing investment
+        else:
             super().save(*args, **kwargs)
 
     # ===== PAYOUT METHODS =====
 
     def process_daily_payout(self):
         """
-        Process a single day's payout - PROFIT ONLY, no principal unlocking
-        Only processes if it's a WEEKDAY (Monday-Friday)
+        Process a single day's payout with ALL guards:
+
+        GUARD 1: Must be a weekday (Mon-Fri)
+        GUARD 2: Must be ACTIVE with remaining_payouts > 0
+        GUARD 3: Must have at least 24 hours since last payout/creation
+        GUARD 4: Uses select_for_update() to prevent race conditions
+        GUARD 5: DB-level unique constraint on (investment, payout_date) for PROFIT
+
+        Returns True if a payout was processed, False otherwise.
         """
-        # === FIXED: Weekend check ===
         now = timezone.now()
+
+        # === GUARD 1: Weekend ===
         if is_weekend(now):
-            # Don't process on weekends
             return False
 
+        # === GUARD 2: Status check ===
         if self.status != 'ACTIVE':
             return False
-
         if self.remaining_payouts <= 0:
-            self.complete_investment()
             return False
 
-        # Check if enough business days have passed
-        if self.last_payout_date:
-            # Count business days since last payout
-            business_days_passed = count_business_days(self.last_payout_date, now)
-        else:
-            # First payout - count business days since creation
-            business_days_passed = count_business_days(self.created_at, now)
-
-        # Only process if at least ONE business day has passed
-        if business_days_passed < 1:
+        # === GUARD 3: 24-hour check (fast pre-check, no lock yet) ===
+        if self._hours_since_reference(now) < self.MIN_HOURS_BETWEEN_PAYOUTS:
             return False
 
-        # Calculate payout (profit only - principal stays locked)
-        profit_amount = self.daily_return
+        # === GUARD 4: Lock and re-verify ===
+        try:
+            with transaction.atomic():
+                locked = Investment.objects.select_for_update().get(pk=self.pk)
 
-        # Create profit transaction
-        transaction = Transaction.objects.create(
-            wallet=self.user.wallet,
-            transaction_type='PROFIT',
-            amount=profit_amount,
-            description=f"Daily profit from {self.token.name}",
-            status='COMPLETED',
-            investment=self
-        )
+                # Re-check status under lock
+                if locked.status != 'ACTIVE' or locked.remaining_payouts <= 0:
+                    return False
 
-        # Update wallet - ONLY ADD PROFIT to available balance
-        wallet = self.user.wallet
-        wallet.balance += profit_amount
-        wallet.total_earned += profit_amount
-        wallet.save()
+                # Re-check weekend (in case time passed)
+                if is_weekend(timezone.now()):
+                    return False
 
-        # Update investment
-        self.total_paid += profit_amount
-        self.remaining_payouts -= 1
-        self.last_payout_date = now
+                # Re-check 24h under lock
+                locked_now = timezone.now()
+                if locked._hours_since_reference(locked_now) < locked.MIN_HOURS_BETWEEN_PAYOUTS:
+                    return False
 
-        if self.remaining_payouts <= 0:
-            self.complete_investment()
-        else:
-            self.save()
+                # Re-check DB-level unique constraint for today's profit
+                today = locked_now.date()
+                already_paid_today = Transaction.objects.filter(
+                    investment=locked,
+                    transaction_type='PROFIT',
+                    payout_date=today,
+                    status='COMPLETED',
+                ).exists()
+                if already_paid_today:
+                    logger.warning(
+                        f"Investment {locked.id}: PROFIT already exists for {today}. Skipping."
+                    )
+                    return False
 
-        return True
+                # ===== PROCESS THE PAYOUT =====
+                profit_amount = locked.daily_return
+                wallet = locked.user.wallet
+
+                # Create PROFIT transaction (payout_date auto-set in Transaction.save)
+                profit_txn = Transaction.objects.create(
+                    wallet=wallet,
+                    transaction_type='PROFIT',
+                    amount=profit_amount,
+                    description=f"Daily profit from {locked.token.name}",
+                    status='COMPLETED',
+                    investment=locked,
+                    payout_date=today,
+                )
+
+                # Credit available balance only (principal stays locked)
+                wallet.balance += profit_amount
+                wallet.total_earned = (wallet.total_earned or Decimal('0')) + profit_amount
+                wallet.save(update_fields=['balance', 'total_earned'])
+
+                # Update investment
+                locked.total_paid = (locked.total_paid or Decimal('0')) + profit_amount
+                locked.remaining_payouts -= 1
+                locked.last_payout_date = locked_now
+
+                if locked.remaining_payouts <= 0:
+                    # Complete investment and return principal
+                    locked.status = 'COMPLETED'
+                    locked.end_date = locked_now
+
+                    wallet.balance += locked.amount
+                    wallet.locked_balance = max(
+                        Decimal('0'), (wallet.locked_balance or Decimal('0')) - locked.amount
+                    )
+                    wallet.save(update_fields=['balance', 'locked_balance'])
+
+                locked.save(update_fields=[
+                    'total_paid', 'remaining_payouts', 'last_payout_date',
+                    'status', 'end_date',
+                ])
+
+                # Mirror state back onto self so callers see fresh values
+                self.total_paid = locked.total_paid
+                self.remaining_payouts = locked.remaining_payouts
+                self.last_payout_date = locked.last_payout_date
+                self.status = locked.status
+                self.end_date = locked.end_date
+
+                return True
+
+        except Exception as e:
+            logger.error(
+                f"process_daily_payout failed for investment {self.id}: {e}",
+                exc_info=True,
+            )
+            return False
 
     def check_and_process_payout(self):
         """
-        Check if payout is due and process if needed
-        Only processes on weekdays
+        Check if payout is due and process if needed.
+        Delegates all guards to process_daily_payout().
         """
         now = timezone.now()
 
-        # === FIXED: Weekend check ===
         if is_weekend(now):
             return False
-
         if self.status != 'ACTIVE' or self.remaining_payouts <= 0:
             return False
+        if self._hours_since_reference(now) < self.MIN_HOURS_BETWEEN_PAYOUTS:
+            return False
 
-        # Check if enough business days have passed
-        if self.last_payout_date:
-            business_days_passed = count_business_days(self.last_payout_date, now)
-        else:
-            business_days_passed = count_business_days(self.created_at, now)
-
-        if business_days_passed >= 1:
-            return self.process_daily_payout()
-
-        return False
+        return self.process_daily_payout()
 
     def complete_investment(self):
         """Mark investment as completed - RETURN THE PRINCIPAL to available balance"""
+        if self.status == 'COMPLETED':
+            return
+
         self.status = 'COMPLETED'
 
-        # Return the FULL principal to available balance
         wallet = self.user.wallet
         wallet.balance += self.amount
-        wallet.locked_balance -= self.amount
-        wallet.save()
+        wallet.locked_balance = max(
+            Decimal('0'), (wallet.locked_balance or Decimal('0')) - self.amount
+        )
+        wallet.save(update_fields=['balance', 'locked_balance'])
 
-        self.save()
+        self.save(update_fields=['status'])
 
     def get_progress_percentage(self):
-        """Calculate investment progress based on business days"""
         total_days = self.token.return_days
         completed_days = total_days - self.remaining_payouts
         return (completed_days / total_days) * 100 if total_days > 0 else 0
 
     def get_formatted_end_date(self):
-        """Get end date formatted for display"""
         return self.end_date.strftime('%A, %B %d, %Y')
 
     def get_business_days_elapsed(self):
-        """Get number of business days elapsed since start"""
         return count_business_days(self.start_date, timezone.now())
 
     def __str__(self):
@@ -883,29 +894,22 @@ class WithdrawalRequest(TimeStampedModel):
     request_id = models.CharField(max_length=50, unique=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='withdrawals')
 
-    # Amount
     amount = models.DecimalField(max_digits=20, decimal_places=2, validators=[MinValueValidator(Decimal('200.00'))])
     tax_amount = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))
     net_amount = models.DecimalField(max_digits=20, decimal_places=2)
 
-    # Payment details
     payment_method = models.CharField(max_length=20, choices=PAYMENT_METHODS, default='MPESA')
     phone_number = models.CharField(max_length=15, blank=True, null=True)
     bank_details = models.JSONField(blank=True, null=True)
 
-    # Status
     status = models.CharField(max_length=20, choices=WITHDRAWAL_STATUS, default='PENDING', db_index=True)
 
-    # Processing
     processed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
                                      related_name='processed_withdrawals')
     processed_at = models.DateTimeField(null=True, blank=True)
     transaction_code = models.CharField(max_length=50, blank=True, null=True)
 
-    # Rejection
     rejection_reason = models.TextField(blank=True, null=True)
-
-    # Admin notes
     admin_notes = models.TextField(blank=True, null=True)
 
     class Meta:
@@ -917,18 +921,14 @@ class WithdrawalRequest(TimeStampedModel):
         ]
 
     def save(self, *args, **kwargs):
-        if not self.pk:  # New withdrawal request
-            # Calculate 5% tax
+        if not self.pk:
             self.tax_amount = self.amount * Decimal('0.05')
             self.net_amount = self.amount - self.tax_amount
 
-            # Check minimum withdrawal
             if self.amount < 200:
                 raise ValidationError("Minimum withdrawal amount is 200 KSH")
 
             wallet = self.user.wallet
-
-            # Check available balance (not locked balance)
             if wallet.balance < self.amount:
                 raise ValidationError(
                     f"Insufficient available balance. You have {wallet.balance} KSH available, but requested {self.amount} KSH.")
@@ -936,7 +936,6 @@ class WithdrawalRequest(TimeStampedModel):
         super().save(*args, **kwargs)
 
     def process(self, admin_user, transaction_code=None):
-        """Approve and process withdrawal"""
         if self.status != 'PENDING':
             raise ValidationError("Can only process pending withdrawals")
 
@@ -947,17 +946,13 @@ class WithdrawalRequest(TimeStampedModel):
         self.save()
 
     def complete(self, admin_user, transaction_code):
-        """Mark withdrawal as completed - DEDUCT FROM AVAILABLE BALANCE ONLY"""
         if self.status not in ['PENDING', 'PROCESSING']:
             raise ValidationError("Can only complete pending or processing withdrawals")
 
         wallet = self.user.wallet
-
-        # Check available balance again
         if wallet.balance < self.amount:
             raise ValidationError(f"Insufficient available balance. Current balance: {wallet.balance} KSH")
 
-        # Create withdrawal transaction
         transaction = Transaction.objects.create(
             wallet=wallet,
             transaction_type='WITHDRAWAL',
@@ -970,12 +965,10 @@ class WithdrawalRequest(TimeStampedModel):
         transaction.processed_at = timezone.now()
         transaction.save()
 
-        # Update wallet - ONLY deduct from available balance
         wallet.balance -= self.amount
         wallet.total_withdrawn += self.amount
         wallet.save()
 
-        # Add tax as separate transaction or record
         if self.tax_amount > 0:
             Transaction.objects.create(
                 wallet=wallet,
@@ -990,7 +983,6 @@ class WithdrawalRequest(TimeStampedModel):
         self.save()
 
     def reject(self, admin_user, reason):
-        """Reject withdrawal request - NO FUNDS TO UNLOCK"""
         if self.status not in ['PENDING', 'PROCESSING']:
             raise ValidationError("Can only reject pending or processing withdrawals")
 
@@ -1001,7 +993,6 @@ class WithdrawalRequest(TimeStampedModel):
         self.save()
 
     def cancel(self):
-        """User cancels withdrawal request - NO FUNDS TO UNLOCK"""
         if self.status != 'PENDING':
             raise ValidationError("Can only cancel pending withdrawals")
 
@@ -1029,7 +1020,6 @@ class SystemConfig(models.Model):
 
     @classmethod
     def get_config(cls, key, default=None):
-        """Get configuration value"""
         try:
             return cls.objects.get(key=key).value
         except cls.DoesNotExist:
@@ -1104,7 +1094,6 @@ class AdminDashboard:
 
     @staticmethod
     def get_dashboard_stats():
-        """Get comprehensive dashboard statistics"""
         from django.db.models import Sum, Count, Avg
 
         today = timezone.now().date()
@@ -1119,12 +1108,10 @@ class AdminDashboard:
             },
             'transactions': {
                 'total_deposits': Transaction.objects.filter(
-                    transaction_type='DEPOSIT',
-                    status='COMPLETED'
+                    transaction_type='DEPOSIT', status='COMPLETED'
                 ).aggregate(total=Sum('amount'))['total'] or 0,
                 'total_withdrawals': Transaction.objects.filter(
-                    transaction_type='WITHDRAWAL',
-                    status='COMPLETED'
+                    transaction_type='WITHDRAWAL', status='COMPLETED'
                 ).aggregate(total=Sum('amount'))['total'] or 0,
                 'pending_deposits': MpesaPayment.objects.filter(status='PENDING').count(),
                 'pending_withdrawals': WithdrawalRequest.objects.filter(status='PENDING').count(),
@@ -1176,25 +1163,20 @@ class ChatRoom(TimeStampedModel):
     room_type = models.CharField(max_length=20, choices=ROOM_TYPES, default='PUBLIC', db_index=True)
     description = models.TextField(blank=True, max_length=500)
 
-    # Relationships
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_chat_rooms')
     participants = models.ManyToManyField(User, related_name='chat_rooms', blank=True)
     moderators = models.ManyToManyField(User, related_name='moderated_rooms', blank=True)
     banned_users = models.ManyToManyField(User, related_name='banned_from_rooms', blank=True)
 
-    # Settings
     is_active = models.BooleanField(default=True)
     is_protected = models.BooleanField(default=False, help_text="Requires approval to join")
     max_participants = models.IntegerField(default=100, validators=[MinValueValidator(2), MaxValueValidator(1000)])
-    password = models.CharField(max_length=128, blank=True, null=True,
-                                help_text="Optional password for protected rooms")
+    password = models.CharField(max_length=128, blank=True, null=True)
 
-    # Metadata
-    icon = models.CharField(max_length=50, blank=True, help_text="FontAwesome or emoji icon")
+    icon = models.CharField(max_length=50, blank=True)
     color = models.CharField(max_length=20, default='primary')
     last_activity = models.DateTimeField(auto_now=True)
 
-    # Stats
     total_messages = models.IntegerField(default=0, editable=False)
     online_count = models.IntegerField(default=0, editable=False)
 
@@ -1221,7 +1203,6 @@ class ChatRoom(TimeStampedModel):
         super().save(*args, **kwargs)
 
     def add_participant(self, user):
-        """Add user to room participants"""
         if user not in self.participants.all() and user not in self.banned_users.all():
             self.participants.add(user)
             self.log_activity(user, 'JOINED')
@@ -1229,7 +1210,6 @@ class ChatRoom(TimeStampedModel):
         return False
 
     def remove_participant(self, user):
-        """Remove user from room participants"""
         if user in self.participants.all():
             self.participants.remove(user)
             self.log_activity(user, 'LEFT')
@@ -1237,30 +1217,25 @@ class ChatRoom(TimeStampedModel):
         return False
 
     def ban_user(self, user, moderator, reason=""):
-        """Ban user from room"""
         if user in self.participants.all():
             self.participants.remove(user)
         self.banned_users.add(user)
         self.log_activity(moderator, 'BAN', target_user=user, reason=reason)
 
     def unban_user(self, user, moderator):
-        """Unban user from room"""
         self.banned_users.remove(user)
         self.log_activity(moderator, 'UNBAN', target_user=user)
 
     def make_moderator(self, user, admin_user):
-        """Make user a moderator"""
         if user in self.participants.all():
             self.moderators.add(user)
             self.log_activity(admin_user, 'MOD_ADD', target_user=user)
 
     def remove_moderator(self, user, admin_user):
-        """Remove moderator status"""
         self.moderators.remove(user)
         self.log_activity(admin_user, 'MOD_REMOVE', target_user=user)
 
     def log_activity(self, user, action, target_user=None, reason=""):
-        """Log room activity"""
         ChatActivity.objects.create(
             room=self,
             user=user,
@@ -1270,7 +1245,6 @@ class ChatRoom(TimeStampedModel):
         )
 
     def can_join(self, user):
-        """Check if user can join room"""
         if user in self.banned_users.all():
             return False, "You are banned from this room"
         if self.participants.count() >= self.max_participants:
@@ -1280,16 +1254,10 @@ class ChatRoom(TimeStampedModel):
         return True, "Allowed"
 
     def get_online_users(self):
-        """Get currently online users in this room"""
-        return self.participants.filter(
-            profile__online_status=True
-        )[:50]
+        return self.participants.filter(profile__online_status=True)[:50]
 
     def update_online_count(self):
-        """Update online count (called by WebSocket)"""
-        self.online_count = self.participants.filter(
-            profile__online_status=True
-        ).count()
+        self.online_count = self.participants.filter(profile__online_status=True).count()
         self.save(update_fields=['online_count'])
 
     def __str__(self):
@@ -1316,32 +1284,23 @@ class ChatMessage(TimeStampedModel):
     room = models.ForeignKey(ChatRoom, on_delete=models.CASCADE, related_name='messages')
     user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='chat_messages')
 
-    # Message content
     message_type = models.CharField(max_length=20, choices=MESSAGE_TYPES, default='TEXT', db_index=True)
     content = models.TextField(blank=True)
 
-    # Rich content
     image = models.ImageField(upload_to='chat/images/%Y/%m/%d/', blank=True, null=True)
     file = models.FileField(upload_to='chat/files/%Y/%m/%d/', blank=True, null=True)
     file_name = models.CharField(max_length=255, blank=True)
     file_size = models.IntegerField(blank=True, null=True)
 
-    # Metadata
     is_edited = models.BooleanField(default=False)
     is_deleted = models.BooleanField(default=False)
     is_pinned = models.BooleanField(default=False)
     is_announcement = models.BooleanField(default=False)
 
-    # Reply to
     reply_to = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='replies')
-
-    # Mentions
     mentions = models.ManyToManyField(User, related_name='mentioned_in_messages', blank=True)
-
-    # Read receipts
     read_by = models.ManyToManyField(User, related_name='read_messages', blank=True)
 
-    # Investment integration
     investment = models.ForeignKey(Investment, on_delete=models.SET_NULL, null=True, blank=True,
                                    related_name='chat_messages')
     transaction = models.ForeignKey(Transaction, on_delete=models.SET_NULL, null=True, blank=True,
@@ -1364,22 +1323,18 @@ class ChatMessage(TimeStampedModel):
         super().save(*args, **kwargs)
 
     def mark_as_read(self, user):
-        """Mark message as read by user"""
         if user not in self.read_by.all():
             self.read_by.add(user)
 
     def get_read_count(self):
-        """Get number of users who read this message"""
         return self.read_by.count()
 
     def soft_delete(self):
-        """Soft delete message"""
         self.is_deleted = True
         self.content = "[This message has been deleted]"
         self.save()
 
     def format_for_websocket(self):
-        """Format message for WebSocket transmission"""
         return {
             'id': str(self.message_id),
             'type': self.message_type,
@@ -1463,16 +1418,12 @@ class ChatNotification(models.Model):
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='chat_notification_settings')
 
-    # Global settings
     sound_enabled = models.BooleanField(default=True)
     desktop_notifications = models.BooleanField(default=True)
     email_notifications = models.BooleanField(default=False)
 
-    # Room-specific settings (JSON field)
-    room_settings = models.JSONField(default=dict, blank=True,
-                                     help_text="Format: {'room_id': {'mute': bool, 'notification_type': 'ALL/MENTIONS/NONE'}}")
+    room_settings = models.JSONField(default=dict, blank=True)
 
-    # Do not disturb
     dnd_enabled = models.BooleanField(default=False)
     dnd_start = models.TimeField(null=True, blank=True)
     dnd_end = models.TimeField(null=True, blank=True)
@@ -1482,7 +1433,6 @@ class ChatNotification(models.Model):
         verbose_name_plural = "Chat Notification Settings"
 
     def should_notify(self, room, message):
-        """Check if user should be notified about message"""
         if self.dnd_enabled and self.dnd_start and self.dnd_end:
             now = timezone.now().time()
             if self.dnd_start <= now <= self.dnd_end:
@@ -1545,15 +1495,12 @@ class DirectMessage(TimeStampedModel):
     user1 = models.ForeignKey(User, on_delete=models.CASCADE, related_name='dm_initiated')
     user2 = models.ForeignKey(User, on_delete=models.CASCADE, related_name='dm_received')
 
-    # Last message preview
     last_message = models.TextField(blank=True, max_length=200)
     last_message_time = models.DateTimeField(auto_now=True)
 
-    # Unread counts
     user1_unread = models.IntegerField(default=0)
     user2_unread = models.IntegerField(default=0)
 
-    # Status
     user1_blocked = models.BooleanField(default=False)
     user2_blocked = models.BooleanField(default=False)
     user1_muted = models.BooleanField(default=False)
@@ -1568,11 +1515,9 @@ class DirectMessage(TimeStampedModel):
         ]
 
     def get_other_user(self, user):
-        """Get the other participant"""
         return self.user2 if user == self.user1 else self.user1
 
     def increment_unread(self, sender):
-        """Increment unread count for recipient"""
         if sender == self.user1:
             self.user2_unread += 1
         else:
@@ -1580,7 +1525,6 @@ class DirectMessage(TimeStampedModel):
         self.save()
 
     def mark_as_read(self, user):
-        """Mark all messages as read for user"""
         if user == self.user1:
             self.user1_unread = 0
         else:
@@ -1614,13 +1558,11 @@ class DirectMessageContent(TimeStampedModel):
         ]
 
     def mark_as_read(self):
-        """Mark message as read"""
         self.is_read = True
         self.read_at = timezone.now()
         self.save()
 
     def mark_as_delivered(self):
-        """Mark message as delivered"""
         self.is_delivered = True
         self.delivered_at = timezone.now()
         self.save()
@@ -1668,21 +1610,18 @@ class ChatNotificationMessage(models.Model):
 
 @receiver(post_save, sender=User)
 def create_chat_notification_settings(sender, instance, created, **kwargs):
-    """Create chat notification settings for new users"""
     if created:
         ChatNotification.objects.get_or_create(user=instance)
 
 
 @receiver(post_save, sender=ChatMessage)
 def create_mention_notifications(sender, instance, created, **kwargs):
-    """Create notifications for mentions"""
     if created and instance.mentions.exists():
         pass
 
 
 @receiver(post_save, sender=ChatRoom)
 def create_room_activity(sender, instance, created, **kwargs):
-    """Log room creation"""
     if created and instance.created_by:
         ChatActivity.objects.create(
             room=instance,
@@ -1696,7 +1635,6 @@ class ChatDashboard:
 
     @staticmethod
     def get_stats():
-        """Get chat system statistics"""
         from django.db.models import Count, Avg
 
         today = timezone.now().date()
